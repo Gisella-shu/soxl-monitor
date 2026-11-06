@@ -43,6 +43,12 @@ NEWS_QUERIES = [
     "Apple OR Microsoft OR Alphabet OR Amazon OR Meta OR Tesla earnings OR launch",
 ]
 NEWS_MAX = 6
+# 只收主流財經／科技媒體，過濾論壇、遊戲站等雜訊
+NEWS_SOURCES = ("reuters", "bloomberg", "cnbc", "wall street journal", "wsj", "marketwatch", "barron",
+                "financial times", "yahoo finance", "associated press", "ap news", "investing.com", "benzinga",
+                "seeking alpha", "nikkei", "fortune", "business insider", "axios", "the information",
+                "techcrunch", "the verge", "forbes", "fox business", "politico", "the new york times",
+                "bnn bloomberg", "investopedia", "the motley fool", "digitimes", "tom's hardware")
 
 # NYSE 休市日
 HOLIDAYS = {date(2026, 11, 26), date(2026, 12, 25), date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15),
@@ -104,26 +110,36 @@ def fetch_funding():
 
 
 # ---------------- 價格 ----------------
+def _chg(a, b):
+    return (a / b - 1) * 100 if (a and b) else None
+
+
 def quote(sym):
-    """回傳 (最新價, 相對前一正盤收盤 %, 是否為盤前盤後價)；失敗回 None。"""
+    """回傳顯示用字串；失敗回 None。
+    指數（^ 開頭）沒有盤前盤後 → 只顯示正盤；期貨 → 相對前一結算；
+    個股/ETF：盤中＝即時｜盤後＝今日收盤＋盤後價｜盤前＝盤前價（相對昨收）。"""
     try:
         r = jhttp(YF.format(urllib.parse.quote(sym)))["chart"]["result"][0]
         m = r["meta"]
         closes = [c for c in (r.get("indicators", {}).get("quote", [{}])[0].get("close") or []) if c is not None]
-        last = closes[-1] if closes else m.get("regularMarketPrice")
-        tp = m.get("currentTradingPeriod", {})
+        last = closes[-1] if closes else None
+        rmp, prev_close = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose")
+        reg = m.get("currentTradingPeriod", {}).get("regular", {})
         now = time.time()
-        reg = tp.get("regular", {})
-        in_reg = reg.get("start", 0) <= now < reg.get("end", 0)
-        if in_reg or sym.endswith("=F"):
-            base = m.get("chartPreviousClose") or m.get("previousClose")
-        elif now < reg.get("start", 0):          # 盤前：基準 = 昨天正盤收盤
-            base = m.get("regularMarketPrice")
-            # range=1d 在盤前時 regularMarketPrice 即前一交易日收盤
-        else:                                     # 盤後：基準 = 今天正盤收盤
-            base = m.get("regularMarketPrice")
-        chg = (last / base - 1) * 100 if (last and base) else None
-        return last, chg, (not in_reg and not sym.endswith("=F"))
+        if sym.startswith("^"):
+            return f"{rmp:,.2f} {pct(_chg(rmp, prev_close), 2)}"
+        if sym.endswith("=F"):
+            p = last or rmp
+            return f"{p:,.2f} {pct(_chg(p, prev_close), 2)}"
+        if reg.get("start", 0) <= now < reg.get("end", 0):
+            p = last or rmp
+            return f"{p:,.2f} {pct(_chg(p, prev_close), 2)}"
+        if now < reg.get("start", 0):  # 盤前：rmp 為前一交易日收盤
+            return f"盤前 {last:,.2f} {pct(_chg(last, rmp), 2)}" if last else f"{rmp:,.2f}（尚無盤前成交）"
+        s = f"收 {rmp:,.2f} {pct(_chg(rmp, prev_close), 2)}"  # 盤後
+        if last and abs(last - rmp) > 1e-9:
+            s += f"｜盤後 {last:,.2f} {pct(_chg(last, rmp), 2)}"
+        return s
     except Exception as e:
         print(f"Yahoo {sym} 失敗:", e)
         return None
@@ -144,6 +160,9 @@ def fetch_news(seen):
             for it in root.iter("item"):
                 title = (it.findtext("title") or "").strip()
                 link = it.findtext("link") or ""
+                src = (it.findtext("source") or title.rsplit(" - ", 1)[-1]).lower()
+                if not any(s in src for s in NEWS_SOURCES):
+                    continue
                 pub = it.findtext("pubDate") or ""
                 key = hashlib.md5(re.sub(r"\s+-\s+[^-]+$", "", title).lower().encode()).hexdigest()[:12]
                 try:
@@ -203,14 +222,9 @@ def build(d, prices, news, prev, now_tpe, now_et):
     L += ["• 陣型：＿＿（自己填）", f"**→ {verdict}**" if red else f"→ {verdict}", ""]
 
     def pline(group, title):
-        out = [f"**▍{title}**（相對前一正盤收盤）"]
+        out = [f"**▍{title}**"]
         for sym, name in group:
-            q = prices.get(sym)
-            if not q or q[0] is None:
-                out.append(f"• {name} {NA}")
-            else:
-                tag = "（盤前/盤後）" if q[2] else ""
-                out.append(f"• {name} {q[0]:,.2f} {pct(q[1], 2)}{tag}")
+            out.append(f"• {name} {prices.get(sym) or NA}")
         return out
     L += pline(MARKET, "大盤") + [""] + pline(MAG7, "七巨頭")
 
