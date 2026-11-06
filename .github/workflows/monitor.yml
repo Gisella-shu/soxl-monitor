@@ -1,0 +1,46 @@
+name: SOXL monitor
+
+on:
+  schedule:
+    - cron: "3 * * * *"   # every hour at :03 UTC-minute (GitHub may delay 5-15 min)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = normal schedule logic, push = force push a report now"
+        default: "push"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: soxl-monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "push" ]; then
+            python monitor.py --push
+          else
+            python monitor.py --run
+          fi
+      - name: Save state
+        run: |
+          if [ -f state.json ] && [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "soxl-monitor-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "state $(date -u +%FT%H:%MZ)" -q
+            git pull --rebase -q || true
+            git push -q || echo "state push failed"
+          fi
