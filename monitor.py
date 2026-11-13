@@ -39,7 +39,7 @@ MAG7 = [("NVDA", "輝達"), ("AAPL", "蘋果"), ("MSFT", "微軟"), ("GOOGL", "G
 ALERT_SYMS = [s for s, _ in INDEX + OTHER]
 LINES = (("z", "張飛", 20), ("g", "關羽", 60), ("l", "劉備", 240))
 
-# 財報：這些一定列；其他公司市值 ≥ 1000 億美元才列
+# 財報：這些一定列；其他公司市值 ≥ 2000 億美元才列
 WATCH_EARN = {s for s, _ in MAG7} | {"AVGO", "TSM", "AMD", "MU", "ASML", "QCOM", "ARM", "INTC", "AMAT", "LRCX",
                                       "KLAC", "MRVL", "SMCI", "ORCL", "CRM", "ADBE", "NFLX", "PLTR", "COST", "WMT"}
 
@@ -269,15 +269,20 @@ WD = "一二三四五六日"
 
 def econ_events(now_tpe):
     out = []
-    for wk in ("thisweek", "nextweek"):
+    for wk in ("thisweek",):  # ForexFactory 只提供本週；週一的行事曆會涵蓋整週
         try:
             for e in jhttp(f"https://nfs.faireconomy.media/ff_calendar_{wk}.json"):
                 if e.get("country") != "USD":
                     continue
-                title = e.get("title", "")
-                zh = next((z for k, z in EVENT_ZH if k.lower() in title.lower()), None)
-                if e.get("impact") != "High" and not zh:
-                    continue
+                title, high = e.get("title", ""), e.get("impact") == "High"
+                if "speaks" in title.lower():  # 官員談話：只收高影響（如主席）
+                    if not high:
+                        continue
+                    zh = "聯準會發言（" + re.sub(r"(?i)\s*(fed chair|fomc member|speaks)\s*", " ", title).strip() + "）"
+                else:
+                    zh = next((z for k, z in EVENT_ZH if k.lower() in title.lower()), None)
+                    if not high and not zh:
+                        continue
                 t = datetime.fromisoformat(e["date"]).astimezone(TPE)
                 if not (now_tpe - timedelta(hours=2) <= t <= now_tpe + timedelta(days=7)):
                     continue
@@ -313,7 +318,7 @@ def earnings(now_et):
             continue
         for r in rows:
             sym = r.get("symbol", "")
-            if sym in WATCH_EARN or _cap(r.get("marketCap")) >= 1e11:
+            if sym in WATCH_EARN or _cap(r.get("marketCap")) >= 2e11:
                 when = {"time-pre-market": "盤前", "time-after-hours": "盤後"}.get(r.get("time"), "")
                 out.append(f"• {d:%m/%d}({WD[d.weekday()]}) {sym} {when}".rstrip())
     return out
@@ -321,7 +326,7 @@ def earnings(now_et):
 
 def build_calendar(now_tpe, now_et):
     ev, ea = econ_events(now_tpe), earnings(now_et)
-    L = [f"**📅 未來 7 天美股行事曆（{now_tpe:%m/%d} 起，台北時間）**", "", "**▍重要數據／聯準會**"]
+    L = [f"**📅 未來 7 天美股行事曆（{now_tpe:%m/%d} 起，台北時間）**", "", "**▍本週重要數據／聯準會**"]
     L += ev or [f"• {NA}（或本週沒有重大數據）"]
     L += ["", "**▍大型股財報**（美東日期）"]
     L += ea or [f"• {NA}（或這 7 天沒有大型股財報）"]
@@ -407,7 +412,12 @@ def main():
     news = fetch_news(set(seen_list))
     _, v = build(res, vix, [], prev, now_tpe, now_et, [])
     events = detect(res, prev, v)
-    text, v = build(res, vix, news, prev, now_tpe, now_et, events)
+    shown = news[:NEWS_MAX]
+    text, v = build(res, vix, shown, prev, now_tpe, now_et, events)
+    while len(text.encode("utf-8")) > 3900 and shown:  # ntfy 上限約 4KB，太長就少放幾則新聞
+        shown = shown[:-1]
+        text, v = build(res, vix, shown, prev, now_tpe, now_et, events)
+    news = shown
 
     if "--run" not in sys.argv:
         print(text)
