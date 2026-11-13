@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""SOXL 資金費率＋美股大盤監控（GitHub Actions 雲端版，推播到 ntfy）。
+"""SOXL 刀神均線三刀流＋美股大盤監控（GitHub Actions 雲端版，推播到 ntfy）。
 
-每小時 :03 由 GitHub Actions 執行（GitHub 排程可能延遲 5–15 分鐘）。
-推播時段（以美東時間計，夏令/冬令自動換算）：
-  盤前  美東 07:xx、08:xx、09:xx   （台北冬令 20:03、21:03、22:03）
-  正盤  美東 10:xx–16:xx            （台北冬令 23:03–05:03）
-  盤後  美東 17:xx、18:xx、19:xx    （台北冬令 06:03、07:03、08:03）
-  僅限美股交易日；其他時間只在四格檢查表翻紅時推播。
-規則：數字一律從 API 取；取不到就寫「取不到」，不用上次的值冒充。不給買賣建議。
+看線方法（出自《海期刀神教你用100張圖實戰均線三刀流》）：
+  60分K 三條均線：小藍 20MA、小綠 60MA、小橘 240MA
+  小橘往上＝多方環境、往下＝空方環境；小藍>小綠>小橘＝多頭排列，反過來＝空頭排列
+  另外看：價格站上/跌破哪條線、藍綠黃金/死亡交叉、日K 季線乖離（>30% 過熱）
+
+每小時 :03 由 GitHub Actions 執行。推播時段：美股交易日 美東 07–19 點每小時一次；
+其他時間只有「站上/跌破小綠或小橘、排列改變、藍綠交叉、小橘轉向、季線乖離破30%」才推播（高優先）。
+規則：數字一律從 API 取；取不到就寫「取不到」。只描述線的狀態，不給買賣建議。
 
 本機測試：python monitor.py            → 印出回報（不推播、不寫 state）
           python monitor.py --push     → 立刻推播一次（不寫 state）
@@ -20,10 +21,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 ET_TZ, TPE = ZoneInfo("America/New_York"), ZoneInfo("Asia/Taipei")
-HL = "https://api.hyperliquid.xyz/info"
-PX = "https://api.pionex.com/api/v1/market/fundingRates?symbol={}&limit=1"
 YF = "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=5m&range=1d&includePrePost=true"
-ASSET = "xyz:SOXL"
 DIR = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(DIR, "state.json")
 NA = "取不到"
@@ -76,37 +74,133 @@ def load_state():
         return {}
 
 
-# ---------------- 資金費率 ----------------
-def fetch_funding():
-    d = {"funding_ann": None, "premium": None, "oi": None, "mark": None, "realized": None,
-         "soxlx_ann": None, "soxsx_ann": None, "soxsx_8h": None}
+# ---------------- 刀神均線三刀流 ----------------
+# 依《海期刀神教你用100張圖實戰均線三刀流》書摘：60分K，小藍=20MA、小綠=60MA、小橘=240MA。
+# 斜率：書上沒寫算法，這裡用「這根 MA 比前一根高或低」判斷上揚／下彎。
+YF_60 = "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=60m&range=3mo"
+YF_1D = "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=6mo"
+LINES = (("blue", "小藍", 20), ("green", "小綠", 60), ("orange", "小橘", 240))
+
+
+def _closes(url):
+    r = jhttp(url)["chart"]["result"][0]
+    q = r["indicators"]["quote"][0]
+    rows = [(c, h) for c, h in zip(q.get("close") or [], q.get("high") or []) if c is not None and h is not None]
+    return [c for c, _ in rows], [h for _, h in rows]
+
+
+def _ma(xs, n, back=0):
+    xs = xs[:len(xs) - back] if back else xs
+    return sum(xs[-n:]) / n if len(xs) >= n else None
+
+
+def analyze(closes, d_closes=None, d_highs=None):
+    """回傳三刀流狀態 dict；資料不足的欄位為 None。"""
+    s = {"price": closes[-1] if closes else None}
+    for key, _, n in LINES:
+        now, before = _ma(closes, n), _ma(closes, n, 1)
+        s[key] = now
+        s[key + "_up"] = None if (now is None or before is None) else now > before
+        s[key + "_above"] = None if now is None else s["price"] > now
+    b, g, o = s["blue"], s["green"], s["orange"]
+    if None in (b, g, o):
+        s["arrange"] = None
+    elif b > g > o:
+        s["arrange"] = "多頭排列"
+    elif b < g < o:
+        s["arrange"] = "空頭排列"
+    else:
+        s["arrange"] = "糾結（沒有排列）"
+    s["env"] = None if s["orange_up"] is None else ("多方環境" if s["orange_up"] else "空方環境")
+    # 藍綠交叉：上一根 vs 這一根
+    pb, pg = _ma(closes, 20, 1), _ma(closes, 60, 1)
+    s["cross"] = None
+    if None not in (b, g, pb, pg):
+        if pb <= pg and b > g:
+            s["cross"] = "黃金交叉"
+        elif pb >= pg and b < g:
+            s["cross"] = "死亡交叉"
+    # 日K 乖離（用今天最高價對日K月線、季線）
+    s["dev_m"] = s["dev_q"] = None
+    if d_closes:
+        m20, m60, hi = _ma(d_closes, 20), _ma(d_closes, 60), d_highs[-1]
+        s["dev_m"] = (hi / m20 - 1) * 100 if m20 else None
+        s["dev_q"] = (hi / m60 - 1) * 100 if m60 else None
+    return s
+
+
+def fetch_ma(sym, daily=True):
     try:
-        meta, ctxs = jhttp(HL, {"type": "metaAndAssetCtxs", "dex": "xyz"})
-        i = next(k for k, u in enumerate(meta["universe"]) if u["name"] == ASSET)
-        c = ctxs[i]
-        d["funding_ann"] = float(c["funding"]) * 24 * 365 * 100
-        d["premium"] = float(c["premium"]) * 100
-        d["oi"] = float(c["openInterest"])
-        d["mark"] = float(c["markPx"])
+        c, _ = _closes(YF_60.format(urllib.parse.quote(sym)))
+        dc = dh = None
+        if daily:
+            try:
+                dc, dh = _closes(YF_1D.format(urllib.parse.quote(sym)))
+            except Exception as e:
+                print(f"Yahoo 日K {sym} 失敗:", e)
+        return analyze(c, dc, dh)
     except Exception as e:
-        print("Hyperliquid ctx 失敗:", e)
-    try:
-        hist = jhttp(HL, {"type": "fundingHistory", "coin": ASSET, "startTime": int(time.time() * 1000) - 3 * 3600 * 1000})
-        rows = sorted(hist, key=lambda h: h["time"])[-3:]
-        if rows:
-            d["realized"] = [[datetime.fromtimestamp(h["time"] / 1000, TPE).strftime("%H:%M"),
-                              float(h["fundingRate"]) * 100] for h in rows]
-    except Exception as e:
-        print("Hyperliquid history 失敗:", e)
-    for sym, key in (("SOXLX_USDT_PERP", "soxlx"), ("SOXSX_USDT_PERP", "soxsx")):
-        try:
-            v = float(jhttp(PX.format(sym))["data"]["rates"][0]["fundingRate"]) * 100
-            d[key + "_ann"] = v * 3 * 365
-            if key == "soxsx":
-                d["soxsx_8h"] = v
-        except Exception as e:
-            print(f"Pionex {sym} 失敗:", e)
-    return d
+        print(f"Yahoo 60分K {sym} 失敗:", e)
+        return None
+
+
+def summary(s):
+    """把狀態翻成一句白話，只引用書上的說法，不給買賣建議。"""
+    if not s or s["arrange"] is None:
+        return "資料不足，無法判斷"
+    below_all = not (s["blue_above"] or s["green_above"] or s["orange_above"])
+    if below_all:
+        return "價格在三條線下面，三條線都是壓力。書上說：站上小藍才算抄底第一波，沒站上前不要硬去挑戰均線。"
+    if s["env"] == "空方環境":
+        return "小橘往下彎＝空方環境。書上說：空方環境切忌積極做多。"
+    if s["arrange"] == "多頭排列":
+        return "小橘往上＋多頭排列＝多方結構。書上說：就算短暫跌破小藍、小綠，只要小橘沒破，多方結構就還在。"
+    if s["orange_above"] is False:
+        return "價格跌破小橘（老大）。書上說：抄底單除非很快站回小橘，否則不要抱太久。"
+    return "小橘往上＝多方環境，但三條線還沒排好，屬於整理階段。"
+
+
+def ma_block(s, name):
+    if not s:
+        return [f"**▍{name} 三刀流（60分K）**", f"• {NA}"]
+    def line(key, label, n):
+        v = s[key]
+        if v is None:
+            return f"• {label}（{n}）：{NA}"
+        arrow = "" if s[key + "_up"] is None else ("↗上揚" if s[key + "_up"] else "↘下彎")
+        pos = "✅ 站上" if s[key + "_above"] else "❌ 跌破"
+        return f"• {label}（{n}）{v:,.2f} {arrow}｜價格{pos}"
+    L = [f"**▍{name} 三刀流（60分K）**", f"• 現價 {s['price']:,.2f}"]
+    L += [line(k, lab, n) for k, lab, n in LINES]
+    L.append(f"• 排列：{s['arrange'] or NA}")
+    L.append(f"• 大環境（看小橘方向）：{s['env'] or NA}")
+    if s["cross"]:
+        L.append(f"• **藍綠{s['cross']}（這一小時剛發生）**")
+    if s["dev_q"] is not None:
+        hot = "　⚠ 超過 30%，書上視為過熱、可能拉回" if s["dev_q"] > 30 else ""
+        L.append(f"• 日K 乖離：月線 {s['dev_m']:+.1f}%｜季線 {s['dev_q']:+.1f}%{hot}")
+    L.append(f"→ {summary(s)}")
+    return L
+
+
+def ma_events(s, prev):
+    """跟上一次比，找出值得馬上通知的變化。"""
+    if not s or not prev:
+        return []
+    ev = []
+    for key, label, _ in LINES[1:]:  # 小綠、小橘 的站上／跌破
+        a, pa = s[key + "_above"], prev.get(key + "_above")
+        if a is not None and pa is not None and a != pa:
+            ev.append(("站上" if a else "跌破") + label)
+    if s["arrange"] and prev.get("arrange") and s["arrange"] != prev["arrange"]:
+        ev.append("轉為" + s["arrange"].split("（")[0])
+    if s["cross"]:
+        ev.append("藍綠" + s["cross"])
+    if s["env"] and prev.get("env") and s["env"] != prev["env"]:
+        ev.append("小橘轉向→" + s["env"])
+    if s["dev_q"] is not None and s["dev_q"] > 30 and not (prev.get("dev_q") or 0) > 30:
+        ev.append("季線乖離超過30%")
+    return ev
 
 
 # ---------------- 價格 ----------------
@@ -186,40 +280,16 @@ def pct(v, nd=1):
     return NA if v is None else f"{v:+.{nd}f}%"
 
 
-def oi_str(v):
-    return NA if v is None else f"{v / 10000:,.1f}萬口"
-
-
-def build(d, prices, news, prev, now_tpe, now_et):
-    oi_chg = (d["oi"] / prev["oi"] - 1) * 100 if (d["oi"] is not None and prev.get("oi")) else None
-    checks = {
-        "費率為正": None if d["funding_ann"] is None else d["funding_ann"] > 0,
-        "OI 無驟減15%": None if oi_chg is None else oi_chg > -15,
-        "SOXS 費率為負": None if d["soxsx_8h"] is None else d["soxsx_8h"] < 0,
-    }
-    red = [k for k, v in checks.items() if v is False]
-    na = [k for k, v in checks.items() if v is None]
-    verdict = "減 1/3" if red else ("無法判定（有欄位取不到）" if na else "續抱")
-
-    has_prev = bool(prev.get("time"))
-    pv = lambda k, nd=0: pct(prev.get(k), nd) if has_prev else NA
-    pr = prev.get("realized")
-    real = NA if not d["realized"] else "  ".join(f"{t} {v:+.4f}%" for t, v in d["realized"])
-    mark = NA if d["mark"] is None else f"{d['mark']:.2f}"
-    oi_now = oi_str(d["oi"]) + (f"({oi_chg:+.1f}%)" if oi_chg is not None else "")
-
-    L = [f"**{now_tpe:%m/%d %H:%M} 台北｜美東 {now_et:%H:%M}**", f"上次：{prev.get('time', '無')}", "",
-         "**▍SOXL 資金費率**（Hyperliquid 標記價 " + mark + "）",
-         f"• 預估年化 {pct(d['funding_ann'], 0)}｜上次 {pv('funding_ann')}",
-         f"• 最近實收 {real}｜上次 " + (f"{pr[-1][0]} {pr[-1][1]:+.4f}%" if pr else NA),
-         f"• OI {oi_now}｜上次 {oi_str(prev.get('oi')) if has_prev else NA}",
-         f"• 溢價 {pct(d['premium'], 2)}｜上次 {pv('premium', 2)}",
-         f"• Pionex SOXLX 年化 {pct(d['soxlx_ann'], 0)}｜上次 {pv('soxlx_ann')}",
-         f"• Pionex SOXSX 年化 {pct(d['soxsx_ann'], 0)}｜上次 {pv('soxsx_ann')}",
-         "", "**▍四格檢查表**"]
-    for k, v in checks.items():
-        L.append(f"• {k}：{NA}" if v is None else (f"• {k}：🟢" if v else f"• **{k}：🔴 翻紅**"))
-    L += ["• 陣型：＿＿（自己填）", f"**→ {verdict}**" if red else f"→ {verdict}", ""]
+def build(soxl, qqq, prices, news, prev, now_tpe, now_et, events):
+    L = [f"**{now_tpe:%m/%d %H:%M} 台北｜美東 {now_et:%H:%M}**", f"上次：{prev.get('time', '無')}", ""]
+    if events:
+        L += ["**⚠ 變化：" + "、".join(events) + "**", ""]
+    L += ma_block(soxl, "SOXL") + [""]
+    if qqq:
+        q = qqq
+        L += ["**▍那指（QQQ）三刀流**",
+              f"• 小綠{'站上' if q['green_above'] else '跌破'}｜小橘{'站上' if q['orange_above'] else '跌破'}"
+              f"｜{q['arrange'] or NA}｜{q['env'] or NA}" if q["arrange"] else f"• {NA}", ""]
 
     def pline(group, title):
         out = [f"**▍{title}**"]
@@ -232,8 +302,8 @@ def build(d, prices, news, prev, now_tpe, now_et):
         L += ["", "**▍新消息標題**"]
         for n in news[:NEWS_MAX]:
             L.append(f"• [{n['t'][:110]}]({n['l']})")
-    L += ["", "僅回報數字與檢查表，不構成投資建議。"]
-    return "\n".join(L), checks
+    L += ["", "依刀神三刀流書上規則整理，只描述線的狀態，不構成投資建議。"]
+    return "\n".join(L)
 
 
 def trim(text, limit=3900):
@@ -261,32 +331,31 @@ def report_window(now_et):
     return 7 <= now_et.hour <= 19
 
 
+KEEP = ("blue_above", "green_above", "orange_above", "arrange", "env", "dev_q")
+
+
 def main():
     now_tpe, now_et = datetime.now(TPE), datetime.now(ET_TZ)
     prev = load_state()
     seen_list = prev.get("seen", [])
-    seen = set(seen_list)
-    d = fetch_funding()
+    soxl = fetch_ma("SOXL")
+    qqq = fetch_ma("QQQ", daily=False)
     prices = fetch_prices()
-    news = fetch_news(seen)
-    text, checks = build(d, prices, news, prev, now_tpe, now_et)
+    news = fetch_news(set(seen_list))
+    events = ma_events(soxl, prev.get("soxl"))
+    text = build(soxl, qqq, prices, news, prev, now_tpe, now_et, events)
 
     if "--run" not in sys.argv:
         print(text)
         if "--push" in sys.argv:
-            push("SOXL／美股 回報", text)
+            push("SOXL 三刀流回報", text)
         return
 
-    prev_checks = prev.get("checks", {})
-    turned_red = [k for k, v in checks.items() if v is False and prev_checks.get(k) is not False]
-    all_fail = all(d[k] is None for k in ("funding_ann", "oi", "soxsx_8h"))
-    send, urgent, title = False, False, "SOXL／美股 回報"
-    if report_window(now_et):
-        send = True
-    if turned_red:
-        send, urgent, title = True, True, "⚠ 檢查表翻紅：" + "、".join(turned_red)
-    if all_fail and prev.get("all_fail"):
-        send, urgent, title = True, True, "⚠ 連續兩小時取不到資金費率資料"
+    send, urgent, title = report_window(now_et), False, "SOXL 三刀流回報"
+    if events:
+        send, urgent, title = True, True, "⚠ SOXL " + "、".join(events)
+    if soxl is None and prev.get("ma_fail"):
+        send, urgent, title = True, True, "⚠ 連續兩小時取不到 SOXL K線資料"
 
     print(text, f"\n[推播：{'是 ' + title if send else '否'}]")
     if send:
@@ -297,10 +366,8 @@ def main():
         if news:  # 只有真的推播出去的標題才記為已讀
             seen_list.extend(n["k"] for n in news[:NEWS_MAX])
 
-    new = {"time": now_tpe.strftime("%m/%d %H:%M"), "checks": checks, "all_fail": all_fail,
-           "seen": seen_list[-400:]}
-    for k in ("funding_ann", "premium", "oi", "realized", "soxlx_ann", "soxsx_ann"):
-        new[k] = d[k]
+    new = {"time": now_tpe.strftime("%m/%d %H:%M"), "ma_fail": soxl is None, "seen": seen_list[-400:],
+           "soxl": {k: soxl[k] for k in KEEP} if soxl else prev.get("soxl")}
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump(new, f, ensure_ascii=False)
 
