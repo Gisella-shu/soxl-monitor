@@ -2,14 +2,14 @@
 """科技大盤＋七巨頭＋BTC／黃金 三刀流監控（GitHub Actions 雲端版，推播到 ntfy）。
 
 看線方法（刀神「均線三刀流」，命名同 JARVIS SELECT）：
-  張飛 20MA（短、藍）、關羽 60MA（中、綠，多空分水嶺）、劉備 240MA（長、橘）
-  多頭排列＝張飛>關羽>劉備；空頭排列＝張飛<關羽<劉備；其他＝糾結（盤整）
-  劉備往上＝多方環境、往下＝空方環境（書上：空方環境切忌積極做多）
+  小藍20MA（短線）、小綠60MA（中線，多空分水嶺）、小橘240MA（長線）
+  多頭排列＝小藍20MA>小綠60MA>小橘240MA；空頭排列＝小藍20MA<小綠60MA<小橘240MA；其他＝糾結（盤整）
+  小橘240MA往上＝多方環境、往下＝空方環境（書上：空方環境切忌積極做多）
   1H 看短線、日K 看大方向；另加 海龜突破（日K 20 日高低點）、MACD 柱狀圖、VIX。
 
 推播：
   1. 每小時回報：美股交易日 美東 07–19 點（含結論：依規則偏多／偏空／觀望）
-  2. 變化快訊（高優先、不限時段）：結論翻轉、主要標的轉成多頭／空頭排列、指數站上／跌破關羽
+  2. 變化快訊（高優先、不限時段）：結論翻轉、主要標的轉成多頭／空頭排列、指數站上／跌破小綠60MA
   3. 每日一則「未來 7 天行事曆」：美國重要數據（CPI、PPI、非農、FOMC…）＋大型股財報
 規則：數字一律從 API 取；取不到就寫「取不到」。結論是規則計算結果，不是投資建議。
 
@@ -37,7 +37,7 @@ OTHER = [("SOXL", "SOXL"), ("BTC-USD", "比特幣"), ("GC=F", "黃金")]
 MAG7 = [("NVDA", "輝達"), ("AAPL", "蘋果"), ("MSFT", "微軟"), ("GOOGL", "Google"),
         ("AMZN", "亞馬遜"), ("META", "Meta"), ("TSLA", "特斯拉")]
 ALERT_SYMS = [s for s, _ in INDEX + OTHER]
-LINES = (("z", "張飛", 20), ("g", "關羽", 60), ("l", "劉備", 240))
+LINES = (("z", "小藍20MA", 20), ("g", "小綠60MA", 60), ("l", "小橘240MA", 240))
 
 # 財報：這些一定列；其他公司市值 ≥ 2000 億美元才列
 WATCH_EARN = {s for s, _ in MAG7} | {"AVGO", "TSM", "AMD", "MU", "ASML", "QCOM", "ARM", "INTC", "AMAT", "LRCX",
@@ -112,7 +112,7 @@ def ema(xs, n):
 
 
 def three_blades(closes):
-    """三刀流狀態：排列、站上幾條、劉備方向、關羽站上與否。"""
+    """三刀流狀態：排列、站上幾條、小橘240MA方向、小綠60MA站上與否。"""
     if not closes:
         return None
     p = closes[-1]
@@ -164,8 +164,8 @@ def score(a):
         return None
     s, h, d = 0, a["h"] or {}, a["d"] or {}
     s += {"多頭": 1, "空頭": -1}.get(h.get("arr"), 0)          # 1H 排列
-    s += {True: 1, False: -1}.get(h.get("l_up"), 0)           # 1H 劉備方向（多空環境）
-    s += {True: 1, False: -1}.get(h.get("g_above"), 0)        # 1H 關羽＝多空分水嶺
+    s += {True: 1, False: -1}.get(h.get("l_up"), 0)           # 1H 小橘240MA方向（多空環境）
+    s += {True: 1, False: -1}.get(h.get("g_above"), 0)        # 1H 小綠60MA＝多空分水嶺
     s += {"多頭": 1, "空頭": -1}.get(d.get("arr"), 0)          # 日K 排列（大方向）
     s += {"突破": 1, "破低": -1}.get(a.get("turtle"), 0)       # 海龜
     s += {True: 1, False: -1}.get(a.get("macd"), 0)           # MACD 動能
@@ -189,10 +189,10 @@ def verdict(results, vix):
     mx = 6 * len(scores)
     if tot >= mx / 3:
         v = "偏多"
-        why = "三大指數多數站上關羽、排列偏多。書上：多頭排列下順勢做多，跌破張飛、關羽但劉備沒破，多方結構不算壞。"
+        why = "三大指數多數站上小綠60MA、排列偏多。書上：多頭排列下順勢做多，跌破小藍20MA、小綠60MA但小橘240MA沒破，多方結構不算壞。"
     elif tot <= -mx / 3:
         v = "偏空"
-        why = "三大指數多數跌破關羽、排列偏空。書上：劉備往下＝空方環境，切忌積極做多；反彈到關羽附近是壓力。"
+        why = "三大指數多數跌破小綠60MA、排列偏空。書上：小橘240MA往下＝空方環境，切忌積極做多；反彈到小綠60MA附近是壓力。"
     else:
         v = "觀望"
         why = "訊號互相矛盾（糾結盤）。網站：三線糾結＝盤整、方向不明；書上：三軍列陣才出手，陣型亂了就收兵。"
@@ -341,7 +341,7 @@ def build(res, vix, news, prev, now_tpe, now_et, events):
     if events:
         L += ["**⚠ 變化：" + "、".join(events) + "**", ""]
     L += [vtxt, ""]
-    L += ["**▍大盤三刀流**（張飛20/關羽60/劉備240）"]
+    L += ["**▍大盤三刀流**（小藍20MA/小綠60MA/小橘240MA）"]
     L += [line_full(n, res.get(s)) for s, n in INDEX]
     L.append("• VIX 恐慌 " + (NA if vix is None else f"{vix:.2f}" + ("（>25 恐慌）" if vix >= 25 else
                                                                    "（20–25 偏高）" if vix >= 20 else "（平靜）")))
@@ -349,7 +349,7 @@ def build(res, vix, news, prev, now_tpe, now_et, events):
     L += ["", "**▍七巨頭**（1H）"] + [line_short(n, res.get(s)) for s, n in MAG7]
     if news:
         L += ["", "**▍新消息**"] + [f"• [{n['t'][:90]}]({n['l']})" for n in news[:NEWS_MAX]]
-    L += ["", "看法：站上x/3＝價格站上幾條均線；【偏多/偏空/觀望】＝1H排列、劉備方向、關羽、日K排列、海龜、MACD 六項加總。"
+    L += ["", "看法：站上x/3＝價格站上幾條均線；【偏多/偏空/觀望】＝1H排列、小橘240MA方向、小綠60MA、日K排列、海龜、MACD 六項加總。"
               "規則計算結果，不是投資建議。"]
     return "\n".join(L), v
 
@@ -371,7 +371,7 @@ def detect(res, prev, v):
         if s in dict(INDEX) or s == "SOXL":
             ga, pga = a["h"]["g_above"], p.get("g_above")
             if ga is not None and pga is not None and ga != pga:
-                ev.append(f"{names[s]}{'站上' if ga else '跌破'}關羽")
+                ev.append(f"{names[s]}{'站上' if ga else '跌破'}小綠60MA")
     return ev
 
 
