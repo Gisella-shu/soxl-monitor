@@ -50,6 +50,9 @@ NEWS_QUERIES = [
     "Fed rate OR CPI OR PPI OR jobs report stocks",
     "Apple OR Microsoft OR Alphabet OR Amazon OR Meta OR Tesla",
     "Bitcoin OR gold price",
+    "Tesla OR \"Elon Musk\" OR SpaceX",
+    "\"Jensen Huang\" OR \"Anthropic IPO\" OR \"SpaceX IPO\" OR Anthropic",
+    "Trump stocks OR Trump tariffs OR Trump chips",
 ]
 NEWS_MAX = 5
 NEWS_SOURCES = ("reuters", "bloomberg", "cnbc", "wall street journal", "wsj", "marketwatch", "barron",
