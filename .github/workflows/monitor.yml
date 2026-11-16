@@ -1,23 +1,30 @@
 name: SOXL monitor
 
+# GitHub 的 schedule 常常延遲好幾小時，所以改成「接力」：
+# 每次執行會在同一個 job 裡每小時（:03）跑一次 monitor，跑滿約 5 小時 40 分後，
+# 自己再觸發下一棒（workflow_dispatch, mode=run）。schedule 只當備援，萬一接力斷了會把它接回來。
+# repo 是 public，Actions 分鐘數免費。
+
 on:
   schedule:
-    - cron: "3 * * * *"   # every hour at :03 UTC-minute (GitHub may delay 5-15 min)
+    - cron: "3 */2 * * *"   # 備援：接力斷掉時重新接上
   workflow_dispatch:
     inputs:
       mode:
-        description: "run = normal schedule logic, push = force push a report now"
+        description: "run = 啟動每小時接力, push = 立刻推播一則回報"
         default: "push"
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
-  group: soxl-monitor
+  group: soxl-monitor-${{ inputs.mode == 'push' && 'push' || 'loop' }}
   cancel-in-progress: false
 
 jobs:
-  run:
+  push-now:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -25,22 +32,44 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run monitor
+      - name: Push report now
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python monitor.py --push
+
+  loop:
+    if: github.event_name == 'schedule' || inputs.mode != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run monitor every hour
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "push" ]; then
-            python monitor.py --push
-          else
-            python monitor.py --run
-          fi
-      - name: Save state
-        run: |
-          if [ -f state.json ] && [ -n "$(git status --porcelain state.json)" ]; then
-            git config user.name "soxl-monitor-bot"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add state.json
-            git commit -m "state $(date -u +%FT%H:%MZ)" -q
-            git pull --rebase -q || true
-            git push -q || echo "state push failed"
-          fi
+          git config user.name "soxl-monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          END=$((SECONDS + 20400))   # 約 5 小時 40 分
+          while true; do
+            git pull --rebase -q || true          # 拿最新程式碼與 state
+            python monitor.py --run || echo "monitor 失敗"
+            if [ -f state.json ] && [ -n "$(git status --porcelain state.json)" ]; then
+              git add state.json
+              git commit -m "state $(date -u +%FT%H:%MZ)" -q
+              git pull --rebase -q || true
+              git push -q || echo "state push failed"
+            fi
+            NOW=$(date +%s)
+            NEXT=$(( (NOW / 3600 + 1) * 3600 + 180 ))   # 下一個整點 :03
+            if [ $((SECONDS + NEXT - NOW)) -gt $END ]; then break; fi
+            echo "下一次：$(date -u -d @$NEXT +%H:%MZ)"
+            sleep $((NEXT - NOW))
+          done
+      - name: Hand off to next run
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref main -f mode=run
