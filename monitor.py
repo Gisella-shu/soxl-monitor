@@ -102,6 +102,48 @@ def candles(sym, interval, rng):
     return [x[0] for x in rows], [x[1] for x in rows], [x[2] for x in rows]
 
 
+def ext_quote(sym):
+    """盤前／盤後最新價（Yahoo includePrePost，美東 04:00–20:00）。
+    回傳 {"label": 盤前/盤後, "p": 價格, "chg": 相對正盤收盤%, "t": 美東時間}；正盤中或取不到回 None。
+    註：夜盤（美東 20:00–04:00，TradingView／券商的 24 小時盤）Yahoo 沒有資料。"""
+    try:
+        r = jhttp(YF.format(urllib.parse.quote(sym), "5m", "1d") + "&includePrePost=true")["chart"]["result"][0]
+    except Exception as e:
+        print(f"Yahoo 盤前盤後 {sym} 失敗:", e)
+        return None
+    m, ts = r.get("meta") or {}, r.get("timestamp") or []
+    pts = [(t, c) for t, c in zip(ts, r["indicators"]["quote"][0].get("close") or []) if c is not None]
+    base, per = m.get("regularMarketPrice"), m.get("currentTradingPeriod") or {}
+    if not pts or not base:
+        return None
+    t, p = pts[-1]
+    reg = per.get("regular") or {}
+    if reg.get("start") and t < reg["start"]:
+        label = "盤前"
+    elif reg.get("end") and t >= reg["end"]:
+        label = "盤後"
+    else:
+        return None
+    return {"label": label, "p": p, "chg": (p / base - 1) * 100,
+            "t": datetime.fromtimestamp(t, ET_TZ).strftime("%H:%M")}
+
+
+def futures_quote(sym):
+    """期貨（近 24 小時交易）最新價與相對前一日結算的漲跌。"""
+    try:
+        m = jhttp(YF.format(urllib.parse.quote(sym), "5m", "1d"))["chart"]["result"][0]["meta"]
+        p, prev = m["regularMarketPrice"], m.get("chartPreviousClose") or m.get("previousClose")
+        return {"p": p, "chg": (p / prev - 1) * 100 if prev else None,
+                "t": datetime.fromtimestamp(m["regularMarketTime"], ET_TZ).strftime("%m/%d %H:%M")}
+    except Exception as e:
+        print(f"Yahoo 期貨 {sym} 失敗:", e)
+        return None
+
+
+def ext_txt(x):
+    return "" if not x else f"｜{x['label']} {fmt_price(x['p'])} {pct(x['chg'])}（美東{x['t']}）"
+
+
 def ma(xs, n, back=0):
     xs = xs[:len(xs) - back] if back else xs
     return sum(xs[-n:]) / n if len(xs) >= n else None
@@ -215,7 +257,7 @@ def line_full(name, a):
     if not a or not a["h"]:
         return f"• {name} {NA}"
     h, d = a["h"], a["d"] or {}
-    parts = [f"{name} {fmt_price(a['p'])} {pct(a['chg'])}",
+    parts = [f"{name} {fmt_price(a['p'])} {pct(a['chg'])}{ext_txt(a.get('ext'))}",
              f"1H {h['arr'] or NA}·站上{h['above']}/3",
              f"日K {d.get('arr') or NA}",
              f"海龜{a['turtle'] or NA}",
@@ -231,7 +273,7 @@ def line_short(name, a):
     if not a or not a["h"]:
         return f"• {name} {NA}"
     h = a["h"]
-    return f"• {name} {fmt_price(a['p'])} {pct(a['chg'])}｜{h['arr'] or NA}·站上{h['above']}/3【{tag(score(a))}】"
+    return f"• {name} {fmt_price(a['p'])} {pct(a['chg'])}{ext_txt(a.get('ext'))}｜{h['arr'] or NA}·站上{h['above']}/3【{tag(score(a))}】"
 
 
 # ---------------- 新聞 ----------------
@@ -338,9 +380,12 @@ def build_calendar(now_tpe, now_et):
 
 
 # ---------------- 組回報 ----------------
-def build(res, vix, news, prev, now_tpe, now_et, events):
+def build(res, vix, news, prev, now_tpe, now_et, events, fut=None):
     v, vtxt = verdict(res, vix)
     L = [f"**{now_tpe:%m/%d %H:%M} 台北｜美東 {now_et:%H:%M}**", ""]
+    if fut is not None:
+        L += ["• 那指期貨(NQ) " + (NA if not fut else
+              f"{fmt_price(fut['p'])} {pct(fut['chg'])}（美東{fut['t']}，近 24 小時交易）"), ""]
     if events:
         L += ["**⚠ 變化：" + "、".join(events) + "**", ""]
     L += [vtxt, ""]
@@ -352,7 +397,8 @@ def build(res, vix, news, prev, now_tpe, now_et, events):
     L += ["", "**▍七巨頭**（1H）"] + [line_short(n, res.get(s)) for s, n in MAG7]
     if news:
         L += ["", "**▍新消息**"] + [f"• [{n['t'][:90]}]({n['l']})" for n in news[:NEWS_MAX]]
-    L += ["", "看法：站上x/3＝價格站上幾條均線；【偏多/偏空/觀望】＝1H排列、小橘240MA方向、小綠60MA、日K排列、海龜、MACD 六項加總。"
+    L += ["", "價格：前面是正盤價／漲跌；「盤前／盤後」是延長盤最新價，漲跌相對正盤收盤。夜盤（美東 20:00–04:00）資料來源沒有，看那指期貨。"]
+    L += ["看法：站上x/3＝價格站上幾條均線；【偏多/偏空/觀望】＝1H排列、小橘240MA方向、小綠60MA、日K排列、海龜、MACD 六項加總。"
               "規則計算結果，不是投資建議。"]
     return "\n".join(L), v
 
@@ -399,8 +445,8 @@ def trading_day(now_et):
 
 
 def report_window(now_et):
-    """美股交易日的 美東 07–19 點（盤前 3 小時＋正盤＋盤後 3 小時）。"""
-    return trading_day(now_et) and 7 <= now_et.hour <= 19
+    """美股交易日的 美東 04–20 點（完整盤前 04:00 起＋正盤＋盤後到 20:00）。"""
+    return trading_day(now_et) and 4 <= now_et.hour <= 20
 
 
 def main():
@@ -408,18 +454,22 @@ def main():
     prev = load_state()
     seen_list = prev.get("seen", [])
     res = {s: analyze(s) for s, _ in INDEX + OTHER + MAG7}
+    for s, _ in [("SOXL", "")] + MAG7:   # 指數、BTC、黃金沒有盤前盤後
+        if res.get(s):
+            res[s]["ext"] = ext_quote(s)
+    fut = futures_quote("NQ=F") or False
     try:
         vix = candles("^VIX", "1d", "5d")[0][-1]
     except Exception as e:
         print("VIX 失敗:", e); vix = None
     news = fetch_news(set(seen_list))
-    _, v = build(res, vix, [], prev, now_tpe, now_et, [])
+    _, v = build(res, vix, [], prev, now_tpe, now_et, [], fut)
     events = detect(res, prev, v)
     shown = news[:NEWS_MAX]
-    text, v = build(res, vix, shown, prev, now_tpe, now_et, events)
+    text, v = build(res, vix, shown, prev, now_tpe, now_et, events, fut)
     while len(text.encode("utf-8")) > 3900 and shown:  # ntfy 上限約 4KB，太長就少放幾則新聞
         shown = shown[:-1]
-        text, v = build(res, vix, shown, prev, now_tpe, now_et, events)
+        text, v = build(res, vix, shown, prev, now_tpe, now_et, events, fut)
     news = shown
 
     if "--run" not in sys.argv:
