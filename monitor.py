@@ -36,7 +36,9 @@ INDEX = [("^NDX", "那指100"), ("^SOX", "費半"), ("^GSPC", "標普500")]
 OTHER = [("SOXL", "SOXL"), ("BTC-USD", "比特幣"), ("GC=F", "黃金")]
 MAG7 = [("NVDA", "輝達"), ("AAPL", "蘋果"), ("MSFT", "微軟"), ("GOOGL", "Google"),
         ("AMZN", "亞馬遜"), ("META", "Meta"), ("TSLA", "特斯拉")]
-ALERT_SYMS = [s for s, _ in INDEX + OTHER]
+# 24 小時交易的代幣（Pionex，優先用永續合約、沒有才用現貨）。代號開頭 PX: 代表走 Pionex。
+TOKENS = [("PX:TQQQX", "TQQQX 代幣"), ("PX:SOXLX", "SOXLX 代幣")]
+ALERT_SYMS = [s for s, _ in INDEX + OTHER + TOKENS]
 LINES = (("z", "小藍20MA", 20), ("g", "小綠60MA", 60), ("l", "小橘240MA", 240))
 
 # 財報：這些一定列；其他公司市值 ≥ 2000 億美元才列
@@ -94,7 +96,50 @@ def load_state():
 
 
 # ---------------- 指標 ----------------
+PX_API = "https://api.pionex.com/api/v1"
+_px_syms = {}
+
+
+def px_symbol(base):
+    """把 TQQQX 之類的代幣名稱對到 Pionex 交易對（永續優先，再來現貨）。"""
+    if base in _px_syms:
+        return _px_syms[base]
+    found = None
+    for typ in ("PERP", "SPOT"):
+        try:
+            data = jhttp(f"{PX_API}/common/symbols?type={typ}").get("data") or {}
+        except Exception as e:
+            print(f"Pionex 交易對清單 {typ} 失敗:", e)
+            continue
+        rows = data.get("symbols") or []
+        for r in rows:
+            b = str(r.get("baseCurrency") or str(r.get("symbol", "")).split("_")[0]).upper()
+            if b == base.upper() and str(r.get("quoteCurrency") or "USDT").upper() == "USDT":
+                found = r.get("symbol"); break
+        if found:
+            break
+        near = sorted({str(r.get("symbol")) for r in rows if base.upper()[:3] in str(r.get("symbol", "")).upper()})
+        print(f"Pionex {typ} 找不到 {base}，相近：{near[:10]}")
+    _px_syms[base] = found
+    return found
+
+
+def px_candles(base, interval):
+    sym = px_symbol(base)
+    if not sym:
+        raise RuntimeError(f"Pionex 沒有 {base}")
+    iv = {"60m": "60M", "1d": "1D"}[interval]
+    d = jhttp(f"{PX_API}/market/klines?symbol={urllib.parse.quote(sym)}&interval={iv}&limit=500")
+    ks = sorted((d.get("data") or {}).get("klines") or [], key=lambda k: k["time"])
+    rows = [(float(k["close"]), float(k["high"]), float(k["low"])) for k in ks]
+    if not rows:
+        raise RuntimeError(f"Pionex {sym} 沒有 K 線")
+    return [x[0] for x in rows], [x[1] for x in rows], [x[2] for x in rows]
+
+
 def candles(sym, interval, rng):
+    if sym.startswith("PX:"):
+        return px_candles(sym[3:], interval)
     r = jhttp(YF.format(urllib.parse.quote(sym), interval, rng))["chart"]["result"][0]
     q = r["indicators"]["quote"][0]
     rows = [(c, h, l) for c, h, l in zip(q.get("close") or [], q.get("high") or [], q.get("low") or [])
@@ -393,11 +438,12 @@ def build(res, vix, news, prev, now_tpe, now_et, events, fut=None):
     L += [line_full(n, res.get(s)) for s, n in INDEX]
     L.append("• VIX 恐慌 " + (NA if vix is None else f"{vix:.2f}" + ("（>25 恐慌）" if vix >= 25 else
                                                                    "（20–25 偏高）" if vix >= 20 else "（平靜）")))
+    L += ["", "**▍24H 代幣**（Pionex，含夜盤／週末）"] + [line_full(n, res.get(s)) for s, n in TOKENS]
     L += ["", "**▍SOXL／比特幣／黃金**"] + [line_full(n, res.get(s)) for s, n in OTHER]
     L += ["", "**▍七巨頭**（1H）"] + [line_short(n, res.get(s)) for s, n in MAG7]
     if news:
         L += ["", "**▍新消息**"] + [f"• [{n['t'][:90]}]({n['l']})" for n in news[:NEWS_MAX]]
-    L += ["", "價格：前面是正盤價／漲跌；「盤前／盤後」是延長盤最新價，漲跌相對正盤收盤。夜盤（美東 20:00–04:00）資料來源沒有，看那指期貨。"]
+    L += ["", "價格：前面是正盤價／漲跌；「盤前／盤後」是延長盤最新價，漲跌相對正盤收盤。夜盤（美東 20:00–04:00）資料來源沒有，看那指期貨與 24H 代幣。"]
     L += ["看法：站上x/3＝價格站上幾條均線；【偏多/偏空/觀望】＝1H排列、小橘240MA方向、小綠60MA、日K排列、海龜、MACD 六項加總。"
               "規則計算結果，不是投資建議。"]
     return "\n".join(L), v
@@ -408,7 +454,7 @@ def detect(res, prev, v):
     pv = prev.get("verdict")
     if v and pv and v != pv:
         ev.append(f"大盤結論 {pv}→{v}")
-    names = dict(INDEX + OTHER)
+    names = dict(INDEX + OTHER + TOKENS)
     ps = prev.get("assets", {})
     for s in ALERT_SYMS:
         a, p = res.get(s), ps.get(s)
@@ -417,7 +463,7 @@ def detect(res, prev, v):
         arr, parr = a["h"]["arr"], p.get("arr")
         if arr in ("多頭", "空頭") and parr and arr != parr:
             ev.append(f"{names[s]}轉{arr}排列")
-        if s in dict(INDEX) or s == "SOXL":
+        if s in dict(INDEX + TOKENS) or s == "SOXL":
             ga, pga = a["h"]["g_above"], p.get("g_above")
             if ga is not None and pga is not None and ga != pga:
                 ev.append(f"{names[s]}{'站上' if ga else '跌破'}小綠60MA")
@@ -453,7 +499,7 @@ def main():
     now_tpe, now_et = datetime.now(TPE), datetime.now(ET_TZ)
     prev = load_state()
     seen_list = prev.get("seen", [])
-    res = {s: analyze(s) for s, _ in INDEX + OTHER + MAG7}
+    res = {s: analyze(s) for s, _ in INDEX + OTHER + TOKENS + MAG7}
     for s, _ in [("SOXL", "")] + MAG7:   # 指數、BTC、黃金沒有盤前盤後
         if res.get(s):
             res[s]["ext"] = ext_quote(s)
